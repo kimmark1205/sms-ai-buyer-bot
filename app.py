@@ -1,6 +1,8 @@
 from fastapi import FastAPI, Request, BackgroundTasks
 import requests
 import os
+import sqlite3
+from datetime import datetime
 
 app = FastAPI()
 
@@ -8,13 +10,92 @@ TELNYX_API_KEY = os.getenv("TELNYX_API_KEY")
 TELNYX_FROM_NUMBER = os.getenv("TELNYX_FROM_NUMBER")
 OPENAI_API_KEY = os.getenv("OPENAI_API_KEY")
 
+DB_FILE = "sms_conversations.db"
+
+STOP_WORDS = {"STOP", "STOPALL", "UNSUBSCRIBE", "CANCEL", "END", "QUIT"}
+
+
+def init_db():
+    conn = sqlite3.connect(DB_FILE)
+    cur = conn.cursor()
+
+    cur.execute("""
+        CREATE TABLE IF NOT EXISTS messages (
+            id INTEGER PRIMARY KEY AUTOINCREMENT,
+            phone TEXT,
+            role TEXT,
+            message TEXT,
+            created_at TEXT
+        )
+    """)
+
+    cur.execute("""
+        CREATE TABLE IF NOT EXISTS opt_outs (
+            phone TEXT PRIMARY KEY,
+            created_at TEXT
+        )
+    """)
+
+    conn.commit()
+    conn.close()
+
+
+init_db()
+
+
+def save_message(phone, role, message):
+    conn = sqlite3.connect(DB_FILE)
+    cur = conn.cursor()
+    cur.execute(
+        "INSERT INTO messages (phone, role, message, created_at) VALUES (?, ?, ?, ?)",
+        (phone, role, message, datetime.utcnow().isoformat())
+    )
+    conn.commit()
+    conn.close()
+
+
+def get_history(phone, limit=10):
+    conn = sqlite3.connect(DB_FILE)
+    cur = conn.cursor()
+    cur.execute(
+        "SELECT role, message FROM messages WHERE phone = ? ORDER BY id DESC LIMIT ?",
+        (phone, limit)
+    )
+    rows = cur.fetchall()
+    conn.close()
+
+    rows.reverse()
+    return [{"role": role, "content": msg} for role, msg in rows]
+
+
+def opt_out(phone):
+    conn = sqlite3.connect(DB_FILE)
+    cur = conn.cursor()
+    cur.execute(
+        "INSERT OR REPLACE INTO opt_outs (phone, created_at) VALUES (?, ?)",
+        (phone, datetime.utcnow().isoformat())
+    )
+    conn.commit()
+    conn.close()
+
+
+def is_opted_out(phone):
+    conn = sqlite3.connect(DB_FILE)
+    cur = conn.cursor()
+    cur.execute("SELECT phone FROM opt_outs WHERE phone = ?", (phone,))
+    row = cur.fetchone()
+    conn.close()
+    return row is not None
+
 
 def send_sms(to, text):
     url = "https://api.telnyx.com/v2/messages"
+
     headers = {
         "Authorization": f"Bearer {TELNYX_API_KEY}",
         "Content-Type": "application/json",
     }
+
     data = {
         "from": TELNYX_FROM_NUMBER,
         "to": to,
@@ -26,30 +107,63 @@ def send_sms(to, text):
     return response.json()
 
 
-def generate_reply(msg):
-    prompt = f"""
-You are a real estate SMS assistant qualifying buyers for vacant land deals in Cripple Creek.
+def classify_interest(text):
+    t = text.lower()
 
-Your job is to continue the conversation naturally after a buyer replies to our outbound text.
+    if any(word in t for word in ["yes", "interested", "send", "buying", "still buying", "what do you have"]):
+        return "hot"
+
+    if any(word in t for word in ["maybe", "depends", "later", "possibly", "what price"]):
+        return "warm"
+
+    if any(word in t for word in ["no", "not interested", "stop", "remove", "wrong number"]):
+        return "dead"
+
+    return "unknown"
+
+
+def generate_ai_reply(phone, incoming_text):
+    history = get_history(phone)
+
+    system_prompt = """
+You are Maria, a buyer qualification SMS assistant for Fast and Easy House Buyers.
+
+You are texting potential buyers about vacant land opportunities in Cripple Creek.
+
+Your job:
+- Qualify if they are actively buying vacant land
+- Ask what areas they buy in
+- Ask what kind of land they want
+- Ask their budget
+- Ask if they buy cash or financing
+- Ask their timeline
+- Ask if they want land deals sent by text or email
 
 Rules:
-- Keep replies short and natural
+- Keep every reply under 220 characters
+- Sound human, casual, and professional
 - Ask only ONE question at a time
-- Focus on:
-  1. area
-  2. land type
-  3. budget
-  4. cash or financing
-  5. timeline
 - Do not sound robotic
 - Do not over-explain
+- Do not pressure them
+- Do not promise profit, ROI, or guaranteed deals
 - If they are not interested, respond politely and end
-- If they ask to stop, acknowledge and end
+- If they ask to stop, do not continue
+- If they ask what this is about, explain briefly that we have vacant land opportunities in Cripple Creek
+- If they seem interested, ask for the best email to send property details
 
-User said: {msg}
+Good replies:
+“Got it, are you mainly buying vacant land in Cripple Creek or nearby areas too?”
+“Nice, what price range are you usually buying land in?”
+“Are you buying cash or using financing?”
+“Perfect, what’s the best email to send details to?”
 """
 
-    res = requests.post(
+    messages = [{"role": "system", "content": system_prompt}]
+    messages.extend(history)
+    messages.append({"role": "user", "content": incoming_text})
+
+    response = requests.post(
         "https://api.openai.com/v1/chat/completions",
         headers={
             "Authorization": f"Bearer {OPENAI_API_KEY}",
@@ -57,16 +171,14 @@ User said: {msg}
         },
         json={
             "model": "gpt-4.1-mini",
-            "messages": [
-                {"role": "user", "content": prompt}
-            ],
+            "messages": messages,
             "temperature": 0.4
         },
         timeout=60
     )
 
-    res.raise_for_status()
-    data = res.json()
+    response.raise_for_status()
+    data = response.json()
     return data["choices"][0]["message"]["content"].strip()
 
 
@@ -78,24 +190,44 @@ def process_inbound(payload):
         return
 
     payload_data = data.get("payload", {})
-    text = payload_data.get("text", "").strip()
+
+    text = (payload_data.get("text") or "").strip()
     from_data = payload_data.get("from", {})
     phone = from_data.get("phone_number")
 
     if not text or not phone:
         return
 
-    stop_words = {"STOP", "STOPALL", "UNSUBSCRIBE", "CANCEL", "END", "QUIT"}
-    if text.upper().strip() in stop_words:
+    if text.upper().strip() in STOP_WORDS:
+        opt_out(phone)
+        save_message(phone, "user", text)
         return
 
-    reply = generate_reply(text)
+    if is_opted_out(phone):
+        return
+
+    save_message(phone, "user", text)
+
+    interest = classify_interest(text)
+    reply = generate_ai_reply(phone, text)
+
+    save_message(phone, "assistant", reply)
     send_sms(phone, reply)
+
+    print({
+        "phone": phone,
+        "incoming": text,
+        "reply": reply,
+        "interest": interest
+    })
 
 
 @app.get("/")
 async def health_check():
-    return {"ok": True, "message": "SMS AI buyer bot is running"}
+    return {
+        "ok": True,
+        "message": "SMS AI buyer bot is running"
+    }
 
 
 @app.post("/webhooks/telnyx/sms")
@@ -119,6 +251,8 @@ async def send_outbound(request: Request):
         }
 
     result = send_sms(to, text)
+
+    save_message(to, "assistant", text)
 
     return {
         "ok": True,

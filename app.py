@@ -9,6 +9,7 @@ app = FastAPI()
 TELNYX_API_KEY = os.getenv("TELNYX_API_KEY")
 TELNYX_FROM_NUMBER = os.getenv("TELNYX_FROM_NUMBER")
 OPENAI_API_KEY = os.getenv("OPENAI_API_KEY")
+ZAPIER_WEBHOOK_URL = os.getenv("ZAPIER_WEBHOOK_URL")
 
 DB_FILE = "sms_conversations.db"
 
@@ -211,7 +212,24 @@ Good replies:
     data = response.json()
     return data["choices"][0]["message"]["content"].strip()
 
+def send_to_zapier(phone, incoming_text, reply, interest):
+    if not ZAPIER_WEBHOOK_URL:
+        return
 
+    payload = {
+        "phone": phone,
+        "latest_reply": incoming_text,
+        "ai_reply": reply,
+        "interest_level": interest,
+        "lead_type": "vacant_land_buyer",
+        "market": "Cripple Creek",
+        "created_at": datetime.utcnow().isoformat()
+    }
+
+    try:
+        requests.post(ZAPIER_WEBHOOK_URL, json=payload, timeout=20)
+    except Exception as e:
+        print("Zapier error:", str(e))
 def process_inbound(payload):
     data = payload.get("data", {})
     event_type = data.get("event_type")
@@ -242,7 +260,8 @@ def process_inbound(payload):
     reply = generate_ai_reply(phone, text)
 
     save_message(phone, "assistant", reply)
-    send_sms(phone, reply)
+send_sms(phone, reply)
+send_to_zapier(phone, text, reply, interest)
 
     print({
         "phone": phone,

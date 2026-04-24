@@ -121,9 +121,39 @@ def classify_interest(text):
 
     return "unknown"
 
-
 def generate_ai_reply(phone, incoming_text):
+    text = incoming_text.lower().strip()
     history = get_history(phone)
+    user_count = len([m for m in history if m["role"] == "user"])
+
+    if any(word in text for word in ["stop", "unsubscribe", "remove", "cancel", "quit"]):
+        return ""
+
+    if any(word in text for word in ["no", "not interested", "wrong number"]):
+        return "Got it, appreciate you letting me know 👍"
+
+    if "@" in text:
+        return "Perfect, I’ll send you deals that fit what you’re looking for 👍"
+
+    if any(word in text for word in ["yes", "yeah", "yep", "still buying", "interested"]):
+        return "Nice, are you mainly focused on Cripple Creek or open to nearby areas too?"
+
+    if user_count == 1:
+        return "Got it. What areas are you buying in right now?"
+
+    if user_count == 2:
+        return "Makes sense. What price range are you usually targeting?"
+
+    if user_count == 3:
+        return "Gotcha. Are you buying cash or using financing?"
+
+    if user_count == 4:
+        return "Solid. How soon are you looking to pick up your next deal?"
+
+    if user_count == 5:
+        return "Sounds good. What’s the best email to send deals to?"
+
+    return "Got it, I’ll keep that in mind 👍"
 
     system_prompt = """
 You are Maria, a buyer qualification SMS assistant for Fast and Easy House Buyers.

@@ -8,11 +8,9 @@ app = FastAPI()
 
 TELNYX_API_KEY = os.getenv("TELNYX_API_KEY")
 TELNYX_FROM_NUMBER = os.getenv("TELNYX_FROM_NUMBER")
-OPENAI_API_KEY = os.getenv("OPENAI_API_KEY")
 ZAPIER_WEBHOOK_URL = os.getenv("ZAPIER_WEBHOOK_URL")
 
 DB_FILE = "sms_conversations.db"
-
 STOP_WORDS = {"STOP", "STOPALL", "UNSUBSCRIBE", "CANCEL", "END", "QUIT"}
 
 
@@ -111,7 +109,7 @@ def send_sms(to, text):
 def classify_interest(text):
     t = text.lower()
 
-    if any(word in t for word in ["yes", "interested", "send", "buying", "still buying", "what do you have"]):
+    if any(word in t for word in ["yes", "yeah", "yep", "interested", "send", "buying", "still buying", "what do you have"]):
         return "hot"
 
     if any(word in t for word in ["maybe", "depends", "later", "possibly", "what price"]):
@@ -121,6 +119,7 @@ def classify_interest(text):
         return "dead"
 
     return "unknown"
+
 
 def generate_ai_reply(phone, incoming_text):
     text = incoming_text.lower().strip()
@@ -136,8 +135,17 @@ def generate_ai_reply(phone, incoming_text):
     if "@" in text:
         return "Perfect, I’ll send you deals that fit what you’re looking for 👍"
 
-    if any(word in text for word in ["yes", "yeah", "yep", "still buying", "interested"]):
+    if any(word in text for word in ["yes", "yeah", "yep", "still buying", "interested", "send"]):
         return "Nice, are you mainly focused on Cripple Creek or open to nearby areas too?"
+
+    if any(word in text for word in ["cripple", "nearby", "colorado", "co"]):
+        return "Makes sense. What price range are you usually targeting?"
+
+    if any(word in text for word in ["cash", "financing", "loan", "hard money"]):
+        return "Solid. How soon are you looking to pick up your next deal?"
+
+    if any(char.isdigit() for char in text):
+        return "Gotcha. Are you buying cash or using financing?"
 
     if user_count == 1:
         return "Got it. What areas are you buying in right now?"
@@ -156,61 +164,6 @@ def generate_ai_reply(phone, incoming_text):
 
     return "Got it, I’ll keep that in mind 👍"
 
-    system_prompt = """
-You are Maria, a buyer qualification SMS assistant for Fast and Easy House Buyers.
-
-You are texting potential buyers about vacant land opportunities in Cripple Creek.
-
-Your job:
-- Qualify if they are actively buying vacant land
-- Ask what areas they buy in
-- Ask what kind of land they want
-- Ask their budget
-- Ask if they buy cash or financing
-- Ask their timeline
-- Ask if they want land deals sent by text or email
-
-Rules:
-- Keep every reply under 220 characters
-- Sound human, casual, and professional
-- Ask only ONE question at a time
-- Do not sound robotic
-- Do not over-explain
-- Do not pressure them
-- Do not promise profit, ROI, or guaranteed deals
-- If they are not interested, respond politely and end
-- If they ask to stop, do not continue
-- If they ask what this is about, explain briefly that we have vacant land opportunities in Cripple Creek
-- If they seem interested, ask for the best email to send property details
-
-Good replies:
-“Got it, are you mainly buying vacant land in Cripple Creek or nearby areas too?”
-“Nice, what price range are you usually buying land in?”
-“Are you buying cash or using financing?”
-“Perfect, what’s the best email to send details to?”
-"""
-
-    messages = [{"role": "system", "content": system_prompt}]
-    messages.extend(history)
-    messages.append({"role": "user", "content": incoming_text})
-
-    response = requests.post(
-        "https://api.openai.com/v1/chat/completions",
-        headers={
-            "Authorization": f"Bearer {OPENAI_API_KEY}",
-            "Content-Type": "application/json"
-        },
-        json={
-            "model": "gpt-4.1-mini",
-            "messages": messages,
-            "temperature": 0.4
-        },
-        timeout=60
-    )
-
-    response.raise_for_status()
-    data = response.json()
-    return data["choices"][0]["message"]["content"].strip()
 
 def send_to_zapier(phone, incoming_text, reply, interest):
     if not ZAPIER_WEBHOOK_URL:
@@ -230,6 +183,8 @@ def send_to_zapier(phone, incoming_text, reply, interest):
         requests.post(ZAPIER_WEBHOOK_URL, json=payload, timeout=20)
     except Exception as e:
         print("Zapier error:", str(e))
+
+
 def process_inbound(payload):
     data = payload.get("data", {})
     event_type = data.get("event_type")
@@ -249,6 +204,7 @@ def process_inbound(payload):
     if text.upper().strip() in STOP_WORDS:
         opt_out(phone)
         save_message(phone, "user", text)
+        send_to_zapier(phone, text, "", "dead")
         return
 
     if is_opted_out(phone):
@@ -259,9 +215,11 @@ def process_inbound(payload):
     interest = classify_interest(text)
     reply = generate_ai_reply(phone, text)
 
-    save_message(phone, "assistant", reply)
-send_sms(phone, reply)
-send_to_zapier(phone, text, reply, interest)
+    if reply:
+        save_message(phone, "assistant", reply)
+        send_sms(phone, reply)
+
+    send_to_zapier(phone, text, reply, interest)
 
     print({
         "phone": phone,
@@ -300,7 +258,6 @@ async def send_outbound(request: Request):
         }
 
     result = send_sms(to, text)
-
     save_message(to, "assistant", text)
 
     return {
